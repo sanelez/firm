@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use tower_lsp_server::lsp_types::*;
 
-use firm_core::{Entity, EntityType};
+use firm_core::{Entity, EntityType, FieldId};
 use firm_core::schema::EntitySchema;
 
 /// Generate field name completions for an entity type.
@@ -141,6 +141,43 @@ pub fn complete_references(
     } else {
         Vec::new()
     }
+}
+
+/// Generate enum value completions for a field with allowed values.
+///
+/// Looks up the schema for the entity type, finds the field, and if it's
+/// an enum with allowed values, returns those as completion items.
+pub fn complete_enum_values(
+    entity_type: &str,
+    field_name: &str,
+    schemas: &HashMap<EntityType, EntitySchema>,
+) -> Vec<CompletionItem> {
+    let schema = match schemas.get(&EntityType::new(entity_type)) {
+        Some(s) => s,
+        None => return Vec::new(),
+    };
+
+    let field_schema = match schema.fields.get(&FieldId::new(field_name)) {
+        Some(f) => f,
+        None => return Vec::new(),
+    };
+
+    let allowed_values = match field_schema.allowed_values() {
+        Some(v) => v,
+        None => return Vec::new(),
+    };
+
+    allowed_values
+        .iter()
+        .enumerate()
+        .map(|(i, value)| CompletionItem {
+            label: value.clone(),
+            kind: Some(CompletionItemKind::ENUM_MEMBER),
+            detail: Some(format!("{field_name} value")),
+            sort_text: Some(format!("{i:04}_{value}")),
+            ..Default::default()
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -302,5 +339,74 @@ mod tests {
         let items = complete_references("contact.nobody.", &entities);
 
         assert!(items.is_empty());
+    }
+
+    fn test_schemas_with_enum() -> HashMap<EntityType, EntitySchema> {
+        let mut schemas = test_schemas();
+        let schema = EntitySchema::new(EntityType::new("project"))
+            .with_required_field(FieldId::new("title"), FieldType::String)
+            .with_required_enum(
+                FieldId::new("status"),
+                vec!["active".to_string(), "completed".to_string(), "on_hold".to_string()],
+            )
+            .with_optional_field(FieldId::new("notes"), FieldType::String);
+        schemas.insert(EntityType::new("project"), schema);
+        schemas
+    }
+
+    #[test]
+    fn test_enum_completions_returns_allowed_values() {
+        let schemas = test_schemas_with_enum();
+        let items = complete_enum_values("project", "status", &schemas);
+
+        assert_eq!(items.len(), 3);
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+        assert!(labels.contains(&"active"));
+        assert!(labels.contains(&"completed"));
+        assert!(labels.contains(&"on_hold"));
+    }
+
+    #[test]
+    fn test_enum_completions_preserves_order() {
+        let schemas = test_schemas_with_enum();
+        let items = complete_enum_values("project", "status", &schemas);
+
+        assert_eq!(items[0].label, "active");
+        assert_eq!(items[1].label, "completed");
+        assert_eq!(items[2].label, "on_hold");
+    }
+
+    #[test]
+    fn test_enum_completions_non_enum_field_returns_empty() {
+        let schemas = test_schemas_with_enum();
+        let items = complete_enum_values("project", "title", &schemas);
+
+        assert!(items.is_empty());
+    }
+
+    #[test]
+    fn test_enum_completions_unknown_field_returns_empty() {
+        let schemas = test_schemas_with_enum();
+        let items = complete_enum_values("project", "nonexistent", &schemas);
+
+        assert!(items.is_empty());
+    }
+
+    #[test]
+    fn test_enum_completions_unknown_type_returns_empty() {
+        let schemas = test_schemas_with_enum();
+        let items = complete_enum_values("unknown", "status", &schemas);
+
+        assert!(items.is_empty());
+    }
+
+    #[test]
+    fn test_enum_completions_kind_is_enum_member() {
+        let schemas = test_schemas_with_enum();
+        let items = complete_enum_values("project", "status", &schemas);
+
+        for item in &items {
+            assert_eq!(item.kind, Some(CompletionItemKind::ENUM_MEMBER));
+        }
     }
 }

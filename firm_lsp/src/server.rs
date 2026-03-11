@@ -234,11 +234,17 @@ impl LanguageServer for FirmLspServer {
         // Use in-memory document text (reflects unsaved edits), fall back to disk
         let docs = self.documents.read().await;
         let text = match docs.get(uri.as_str()) {
-            Some(t) => t.clone(),
-            None => match std::fs::read_to_string(&file_path) {
-                Ok(t) => t,
-                Err(_) => return Ok(None),
-            },
+            Some(t) => {
+                log::info!("completion: using cached document text ({} chars)", t.len());
+                t.clone()
+            }
+            None => {
+                log::info!("completion: no cached text for {}, reading from disk", uri.as_str());
+                match std::fs::read_to_string(&file_path) {
+                    Ok(t) => t,
+                    Err(_) => return Ok(None),
+                }
+            }
         };
         drop(docs);
 
@@ -260,25 +266,47 @@ impl LanguageServer for FirmLspServer {
         let data_guard = self.workspace_data.read().await;
         let data = match data_guard.as_ref() {
             Some(d) => d,
-            None => return Ok(None),
+            None => {
+                log::info!("completion: no workspace data cached yet");
+                return Ok(None);
+            }
         };
 
         // Determine completion context by walking up from cursor node
         if let Some(node) = cursor_node {
+            let line_text = text.lines().nth(position.line as usize).unwrap_or("");
+            log::info!(
+                "completion: pos=({},{}) node_kind={:?} line={:?}",
+                position.line, position.character, node.kind(), line_text
+            );
             let context = detect_completion_context(node, &text, position);
 
             match context {
-                CompletionContext::FieldName { entity_type, existing_fields } => {
+                CompletionContext::FieldName { ref entity_type, ref existing_fields } => {
+                    log::info!("completion: context=FieldName entity_type={entity_type} existing={existing_fields:?}");
                     let items = completion::complete_field_names(
-                        &entity_type,
+                        entity_type,
                         &existing_fields.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
                         &data.schemas,
                     );
                     return Ok(Some(CompletionResponse::Array(items)));
                 }
-                CompletionContext::Reference { prefix } => {
-                    let items = completion::complete_references(&prefix, &data.entities);
+                CompletionContext::Reference { ref prefix } => {
+                    log::info!("completion: context=Reference prefix={prefix:?}");
+                    let items = completion::complete_references(prefix, &data.entities);
                     return Ok(Some(CompletionResponse::Array(items)));
+                }
+                CompletionContext::FieldValue { ref entity_type, ref field_name } => {
+                    log::info!("completion: context=FieldValue entity_type={entity_type} field_name={field_name}");
+                    let items = completion::complete_enum_values(
+                        entity_type,
+                        field_name,
+                        &data.schemas,
+                    );
+                    log::info!("completion: enum items count={}", items.len());
+                    if !items.is_empty() {
+                        return Ok(Some(CompletionResponse::Array(items)));
+                    }
                 }
                 CompletionContext::None => {}
             }
@@ -321,6 +349,11 @@ enum CompletionContext {
     Reference {
         prefix: String,
     },
+    /// Cursor is in a value position for a field (after `=`, no dot).
+    FieldValue {
+        entity_type: String,
+        field_name: String,
+    },
     /// No actionable context detected.
     None,
 }
@@ -344,40 +377,41 @@ fn detect_completion_context(
     // e.g. "  contact = contact." or "  manager = person.ja"
     let trimmed = text_before_cursor.trim();
 
-    // Look for reference pattern after `=`: something like `identifier.` or `identifier.partial`
+    // Text-based: if the line contains `=` and cursor is after it, we're in a value position.
+    // This takes priority over tree-sitter node walking since incomplete text may not produce
+    // the expected node types.
     if let Some(after_eq) = trimmed.rsplit_once('=') {
         let value_text = after_eq.1.trim();
+
+        // If the value contains a dot, it's a reference completion
         if value_text.contains('.') {
             return CompletionContext::Reference {
                 prefix: value_text.to_string(),
             };
         }
-    }
 
-    // Check if the trigger was a dot (reference completion context)
-    if text_before_cursor.ends_with('.') {
-        // Walk up to find if we're in a value position
-        let mut current = node;
-        loop {
-            let kind = current.kind();
-            if kind == "entity_block" || kind == "source_file" {
-                break;
-            }
-            if kind == "value" || kind == "reference" || kind == "field" {
-                // Extract the text before the dot on this line as prefix
-                let line_trimmed = text_before_cursor.trim();
-                if let Some(after_eq) = line_trimmed.rsplit_once('=') {
-                    return CompletionContext::Reference {
-                        prefix: after_eq.1.trim().to_string(),
-                    };
+        // Otherwise it's a field value position — extract field name and entity type
+        // for enum completions. Walk tree-sitter to find the enclosing entity_block.
+        let field_name = after_eq.0.trim().to_string();
+        if !field_name.is_empty() {
+            let mut current = node;
+            loop {
+                if current.kind() == "entity_block" {
+                    if let Some(entity_type) = extract_entity_type(current, source) {
+                        return CompletionContext::FieldValue {
+                            entity_type,
+                            field_name,
+                        };
+                    }
+                    break;
                 }
-                return CompletionContext::Reference {
-                    prefix: line_trimmed.to_string(),
-                };
-            }
-            match current.parent() {
-                Some(p) => current = p,
-                None => break,
+                if current.kind() == "source_file" {
+                    break;
+                }
+                match current.parent() {
+                    Some(p) => current = p,
+                    None => break,
+                }
             }
         }
     }
@@ -401,10 +435,6 @@ fn detect_completion_context(
         }
         if kind == "source_file" {
             break;
-        }
-        // If we're inside a value node, don't offer field completions
-        if kind == "value" {
-            return CompletionContext::None;
         }
         match current.parent() {
             Some(p) => current = p,
@@ -538,5 +568,181 @@ fn uri_to_path(uri: &Uri) -> Option<PathBuf> {
         Some(PathBuf::from(path))
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Helper: parse source, find node at position, run detect_completion_context.
+    fn detect_context(source: &str, line: u32, character: u32) -> CompletionContext {
+        let parsed = parse_source(source.to_string(), None).unwrap();
+        let tree = &parsed.tree;
+        let root = tree.root_node();
+        let point = tree_sitter::Point::new(line as usize, character as usize);
+        let node = root
+            .descendant_for_point_range(point, point)
+            .expect("no node at cursor position");
+
+        log::info!(
+            "Node at ({}, {}): kind={:?} text={:?}",
+            line,
+            character,
+            node.kind(),
+            &source[node.start_byte()..node.end_byte()]
+        );
+
+        detect_completion_context(node, source, Position { line, character })
+    }
+
+    #[test]
+    fn test_context_field_name_on_empty_line_in_block() {
+        let source = "project my_project {\n    title = \"hello\"\n    \n}";
+        //                                                    ^ line 2, col 4
+        let ctx = detect_context(source, 2, 4);
+        match ctx {
+            CompletionContext::FieldName { entity_type, .. } => {
+                assert_eq!(entity_type, "project");
+            }
+            other => panic!("Expected FieldName, got {:?}", context_name(&other)),
+        }
+    }
+
+    #[test]
+    fn test_context_field_value_after_equals() {
+        let source = "project my_project {\n    status = \n}";
+        //                                            ^ line 1, col 13
+        let ctx = detect_context(source, 1, 13);
+        match ctx {
+            CompletionContext::FieldValue {
+                entity_type,
+                field_name,
+            } => {
+                assert_eq!(entity_type, "project");
+                assert_eq!(field_name, "status");
+            }
+            other => panic!("Expected FieldValue, got {:?}", context_name(&other)),
+        }
+    }
+
+    #[test]
+    fn test_context_field_value_after_equals_with_partial_text() {
+        let source = "project my_project {\n    status = act\n}";
+        //                                               ^ line 1, col 16
+        let ctx = detect_context(source, 1, 16);
+        match ctx {
+            CompletionContext::FieldValue {
+                entity_type,
+                field_name,
+            } => {
+                assert_eq!(entity_type, "project");
+                assert_eq!(field_name, "status");
+            }
+            other => panic!("Expected FieldValue, got {:?}", context_name(&other)),
+        }
+    }
+
+    #[test]
+    fn test_context_reference_after_dot() {
+        let source = "project my_project {\n    contact = person.\n}";
+        //                                                     ^ line 1, col 22
+        let ctx = detect_context(source, 1, 22);
+        match ctx {
+            CompletionContext::Reference { prefix } => {
+                assert_eq!(prefix, "person.");
+            }
+            other => panic!("Expected Reference, got {:?}", context_name(&other)),
+        }
+    }
+
+    #[test]
+    fn test_context_reference_field_after_second_dot() {
+        let source = "project my_project {\n    contact = person.jane.\n}";
+        //                                                           ^ line 1, col 27
+        let ctx = detect_context(source, 1, 27);
+        match ctx {
+            CompletionContext::Reference { prefix } => {
+                assert_eq!(prefix, "person.jane.");
+            }
+            other => panic!("Expected Reference, got {:?}", context_name(&other)),
+        }
+    }
+
+    #[test]
+    fn test_context_field_value_realistic_enum_typing() {
+        // Simulates typing `status = e` inside an account entity
+        let source = "account acme {\n    name = \"Acme\"\n    status = e\n}";
+        //                                                          ^ line 2, col 15
+        let ctx = detect_context(source, 2, 15);
+        match ctx {
+            CompletionContext::FieldValue {
+                entity_type,
+                field_name,
+            } => {
+                assert_eq!(entity_type, "account");
+                assert_eq!(field_name, "status");
+            }
+            other => panic!("Expected FieldValue, got {:?}", context_name(&other)),
+        }
+    }
+
+    #[test]
+    fn test_context_field_value_cursor_right_after_equals_space() {
+        // Simulates cursor right after `= ` with nothing typed yet
+        let source = "account acme {\n    status = \n}";
+        //                                        ^ line 1, col 13
+        let ctx = detect_context(source, 1, 13);
+        match ctx {
+            CompletionContext::FieldValue {
+                entity_type,
+                field_name,
+            } => {
+                assert_eq!(entity_type, "account");
+                assert_eq!(field_name, "status");
+            }
+            other => panic!("Expected FieldValue, got {:?}", context_name(&other)),
+        }
+    }
+
+    #[test]
+    fn test_context_field_value_with_existing_complete_field_above() {
+        // Entity has one complete field, cursor on second field after =
+        let source = "account acme {\n    name = \"Acme\"\n    status = \n}";
+        //                                                            ^ line 2, col 13
+        let ctx = detect_context(source, 2, 13);
+        match ctx {
+            CompletionContext::FieldValue {
+                entity_type,
+                field_name,
+            } => {
+                assert_eq!(entity_type, "account");
+                assert_eq!(field_name, "status");
+            }
+            other => panic!("Expected FieldValue, got {:?}", context_name(&other)),
+        }
+    }
+
+    #[test]
+    fn test_context_field_name_no_equals_on_line() {
+        // Just typing a new field name, no = yet
+        let source = "account acme {\n    name = \"Acme\"\n    st\n}";
+        //                                                     ^ line 2, col 6
+        let ctx = detect_context(source, 2, 6);
+        match ctx {
+            CompletionContext::FieldName { entity_type, .. } => {
+                assert_eq!(entity_type, "account");
+            }
+            other => panic!("Expected FieldName, got {:?}", context_name(&other)),
+        }
+    }
+
+    fn context_name(ctx: &CompletionContext) -> &'static str {
+        match ctx {
+            CompletionContext::FieldName { .. } => "FieldName",
+            CompletionContext::Reference { .. } => "Reference",
+            CompletionContext::FieldValue { .. } => "FieldValue",
+            CompletionContext::None => "None",
+        }
     }
 }
